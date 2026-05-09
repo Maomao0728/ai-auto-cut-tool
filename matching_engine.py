@@ -30,17 +30,26 @@ def material_label(path: Path, material_tags: dict[str, list[str]] | None = None
 
 def sentence_keywords(sentence: str, visual_keywords: list[str]) -> list[str]:
     text = normalize_text(sentence + "".join(visual_keywords))
-    matched = []
+    matched: list[str] = []
+    priority_terms = [
+        "峰会", "展会", "入口", "注册", "导览", "展台", "政务", "助手", "智慧", "服务",
+        "平台", "城市", "治理", "民生", "科技", "创新", "支付", "生活", "群众", "办事",
+        "体验", "互动", "团队", "产品", "展示", "未来", "全景", "合影", "讲解", "签到", "路演",
+    ]
+    for term in priority_terms:
+        if term in text and term not in matched:
+            matched.append(term)
     for _label, keywords in SCENE_KEYWORDS.items():
         if any(keyword.lower() in text for keyword in keywords):
-            matched.extend(keywords[:3])
-            matched.append(_label)
-    matched.extend(visual_keywords)
-    unique = []
-    for item in matched:
-        if item not in unique:
-            unique.append(item)
-    return unique
+            for kw in keywords[:3]:
+                if kw not in matched:
+                    matched.append(kw)
+            if _label not in matched:
+                matched.append(_label)
+    for keyword in visual_keywords:
+        if keyword not in matched:
+            matched.append(keyword)
+    return matched[:8] if matched else visual_keywords[:4]
 
 
 def score_material(sentence: str, visual_keywords: list[str], path: Path, material_tags: dict[str, list[str]] | None = None) -> int:
@@ -80,6 +89,12 @@ def _find_custom_material(material_paths: list[Path], material_hint: str) -> Pat
     return None
 
 
+def _content_tokens(sentence: str, visual_keywords: list[str]) -> list[str]:
+    tokens = sentence_keywords(sentence, visual_keywords)
+    priority = [token for token in tokens if len(token) <= 6]
+    return priority[:8] if priority else tokens[:8]
+
+
 def assign_materials_to_storyboard(
     storyboard: list[dict[str, Any]],
     material_paths: list[Path],
@@ -102,13 +117,14 @@ def assign_materials_to_storyboard(
 
         sentence = str(item.get("文案", ""))
         visual_keywords = list(item.get("画面关键词", []))
+        content_tokens = _content_tokens(sentence, visual_keywords)
         ranked = sorted(
             material_paths,
-            key=lambda path: (score_material(sentence, visual_keywords, path, material_tags), path not in used),
+            key=lambda path: (score_material(sentence, content_tokens, path, material_tags), path not in used),
             reverse=True,
         )
         selected = ranked[0] if ranked else material_paths[index % len(material_paths)]
-        if score_material(sentence, visual_keywords, selected, material_tags) <= 0:
+        if score_material(sentence, content_tokens, selected, material_tags) <= 0:
             selected = material_paths[index % len(material_paths)]
         used.add(selected)
         item["匹配素材"] = selected.name

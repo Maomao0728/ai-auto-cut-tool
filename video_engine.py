@@ -10,6 +10,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
 
 def canvas_size(aspect_ratio: str) -> tuple[int, int]:
     if aspect_ratio.startswith("9:16"):
@@ -41,45 +44,51 @@ def wrap_text(text: str, max_chars: int) -> list[str]:
     return textwrap.wrap(text, width=max_chars) or [text]
 
 
-def draw_overlay(frame: np.ndarray, subtitle: str, style: str, keywords: list[str]) -> np.ndarray:
+def _visible_subtitle_line(text: str, _progress: float, _max_chars: int) -> str:
+    clean_text = "".join(str(text).split())
+    if not clean_text:
+        return ""
+    # 稳定模式：每个分镜直接显示该分镜完整文案，确保字音一致
+    return clean_text
+
+
+def draw_overlay(
+    frame: np.ndarray,
+    subtitle: str,
+    _style: str,
+    _keywords: list[str],
+    progress: float = 1.0,
+) -> np.ndarray:
     height, width = frame.shape[:2]
     image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    title_font = load_font(max(28, width // 34))
-    tag_font = load_font(max(18, width // 58))
-    subtitle_font = load_font(max(30, width // 32))
+    subtitle_font = load_font(max(30, width // 34))
+    max_chars = 16 if width < height else 24
+    line = _visible_subtitle_line(subtitle, max(0.0, min(progress, 1.0)), max_chars)
+    if not line:
+        return frame
 
-    draw.rectangle([(0, 0), (width, int(height * 0.18))], fill=(0, 0, 0, 96))
-    draw.text((40, 28), "AI 全自动剪辑 · " + style, font=title_font, fill=(255, 255, 255, 245))
+    bbox = draw.textbbox((0, 0), line, font=subtitle_font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad_x = max(22, width // 70)
+    pad_y = max(10, height // 90)
+    box_w = min(text_w + pad_x * 2, width - 72)
+    box_h = text_h + pad_y * 2
+    box_x = (width - box_w) // 2
+    box_y = int(height * 0.82)
 
-    x = 40
-    y = 80
-    for keyword in keywords[:4]:
-        tag = f"#{keyword}"
-        box = draw.textbbox((0, 0), tag, font=tag_font)
-        tag_w = box[2] - box[0] + 28
-        draw.rounded_rectangle([(x, y), (x + tag_w, y + 34)], radius=17, fill=(22, 119, 255, 210))
-        draw.text((x + 14, y + 5), tag, font=tag_font, fill=(255, 255, 255, 245))
-        x += tag_w + 10
-
-    bottom_h = int(height * 0.24)
-    draw.rectangle([(0, height - bottom_h), (width, height)], fill=(0, 0, 0, 136))
-    max_chars = 22 if width < height else 34
-    lines = wrap_text(subtitle, max_chars=max_chars)[:3]
-    line_height = 46
-    total_h = len(lines) * line_height
-    start_y = height - bottom_h + max((bottom_h - total_h) // 2, 8)
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=subtitle_font)
-        text_w = bbox[2] - bbox[0]
-        draw.text(((width - text_w) // 2, start_y), line, font=subtitle_font, fill=(255, 255, 255, 255))
-        start_y += line_height
+    draw.rounded_rectangle(
+        [(box_x, box_y), (box_x + box_w, box_y + box_h)],
+        radius=max(16, box_h // 2),
+        fill=(0, 0, 0, 118),
+    )
+    draw.text(((width - text_w) // 2, box_y + pad_y - 2), line, font=subtitle_font, fill=(255, 255, 255, 255))
 
     composed = Image.alpha_composite(image, overlay).convert("RGB")
     return cv2.cvtColor(np.array(composed), cv2.COLOR_RGB2BGR)
-
 
 def make_gradient_frame(width: int, height: int, index: int) -> np.ndarray:
     x = np.linspace(0, 1, width, dtype=np.float32)
@@ -186,6 +195,35 @@ def animated_image_frame(
     return frame
 
 
+
+def _preferred_material_type(segment_index: int, storyboard: list[dict[str, Any]]) -> str:
+    preferred_name = _preferred_material_name(segment_index, storyboard)
+    suffix = Path(preferred_name).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    return ""
+
+
+def _use_image_for_segment(
+    video_paths: list[Path],
+    image_paths: list[Path],
+    segment_index: int,
+    storyboard: list[dict[str, Any]],
+) -> bool:
+    preferred_type = _preferred_material_type(segment_index, storyboard)
+    if preferred_type == "image":
+        return True
+    if preferred_type == "video":
+        return False
+    if not video_paths:
+        return True
+    if not image_paths:
+        return False
+    return segment_index % 2 == 1
+
+
 def video_frame_reader(video_paths: list[Path], width: int, height: int):
     if not video_paths:
         while True:
@@ -226,7 +264,7 @@ def _pick_video_frame(
     segment_index: int,
     frame_index: int,
     storyboard: list[dict[str, Any]],
-    fallback_reader: Any,
+    _fallback_reader: Any | None = None,
 ) -> np.ndarray | None:
     preferred_name = _preferred_material_name(segment_index, storyboard)
     if preferred_name:
@@ -234,7 +272,9 @@ def _pick_video_frame(
         for candidate in video_paths:
             if _normalize_filename(candidate.name) == normalized_preferred:
                 return _read_video_frame(candidate, width, height, frame_index)
-    return next(fallback_reader)
+    if not video_paths:
+        return None
+    return _read_video_frame(video_paths[segment_index % len(video_paths)], width, height, frame_index)
 
 
 def mux_audio(
@@ -295,12 +335,18 @@ def compose_basic_video(
         seconds = float(str(item["建议时长"]).replace("秒", ""))
         frames_needed = max(1, int(math.ceil(seconds * fps)))
         for frame_index in range(frames_needed):
-            frame = _pick_video_frame(video_paths, width, height, index, frame_index, storyboard, reader)
+            if _use_image_for_segment(video_paths, image_paths, index, storyboard):
+                frame = animated_image_frame(image_paths, width, height, index, frame_index, frames_needed, storyboard)
+            else:
+                frame = _pick_video_frame(video_paths, width, height, index, frame_index, storyboard, reader)
             if frame is None:
                 frame = animated_image_frame(image_paths, width, height, index, frame_index, frames_needed, storyboard)
             if frame is None:
+                frame = _pick_video_frame(video_paths, width, height, index, frame_index, storyboard, reader)
+            if frame is None:
                 frame = make_gradient_frame(width, height, index)
-            frame = draw_overlay(frame, str(item["文案"]), style, list(item["画面关键词"]))
+            subtitle_progress = (frame_index + 1) / frames_needed
+            frame = draw_overlay(frame, str(item["文案"]), style, list(item["画面关键词"]), subtitle_progress)
             writer.write(frame)
             written += 1
     writer.release()

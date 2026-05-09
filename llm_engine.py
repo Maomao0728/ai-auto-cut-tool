@@ -7,6 +7,7 @@ from typing import Any
 import requests
 
 from api_config import get_app_config
+from matching_engine import sentence_keywords
 
 STYLE_KEYWORDS = {
     "政务/民生宣传": ["政务大厅", "办事窗口", "工作人员", "群众", "服务", "数据大屏", "城市", "政策"],
@@ -18,26 +19,67 @@ STYLE_KEYWORDS = {
 CAMERA_SUGGESTIONS = ["缓慢推近", "从右到左", "从左到右", "从上到下", "固定镜头", "缓慢拉远"]
 
 
+def extract_script_topics(script: str, style: str, limit: int = 6) -> list[str]:
+    topic_text = sentence_keywords(script, STYLE_KEYWORDS.get(style, []))
+    topics: list[str] = []
+    for item in topic_text:
+        if item not in topics:
+            topics.append(item)
+    if not topics:
+        topics = STYLE_KEYWORDS.get(style, STYLE_KEYWORDS["业务介绍"])
+    return topics[:limit]
+
+
 def split_script_sentences(script: str) -> list[str]:
-    normalized = script.replace("；", "。").replace(";", "。").replace("！", "。").replace("？", "。")
-    sentences = [item.strip(" ，,。\n\t") for item in normalized.split("。")]
-    return [item for item in sentences if item]
+    normalized = script.replace("；", "。")
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    rough: list[str] = []
+    for line in lines or [normalized]:
+        parts = [item.strip(" ，,。！？!?；;\t") for item in re.split(r"[。！？!?；;]", line)]
+        rough.extend([item for item in parts if item])
+
+    # 合并过短口语句，避免“没错”这类单独成句
+    merged: list[str] = []
+    for part in rough:
+        if len(part) <= 3 and merged:
+            merged[-1] = f"{merged[-1]}，{part}"
+        else:
+            merged.append(part)
+    return merged
 
 
 def local_keywords(sentence: str, style: str) -> list[str]:
     preset = STYLE_KEYWORDS.get(style, STYLE_KEYWORDS["业务介绍"])
-    matched: list[str] = []
-    for keyword in preset:
-        if keyword[:2] in sentence or keyword in sentence:
-            matched.append(keyword)
-    if not matched:
-        text = sentence.lower()
-        for keyword in preset:
-            if any(token in text for token in ["服务", "产品", "数据", "业务", "群众", "就业", "政务", "汇报", "ai", "智能"]):
-                matched.append(keyword)
-            if len(matched) >= 4:
-                break
-    return matched[:4] or preset[:4]
+
+    phrase_candidates = re.findall(r"[\u4e00-\u9fff]{2,8}", sentence)
+    stop_words = {"我们", "你们", "他们", "这个", "那个", "进行", "实现", "推进", "持续", "提升", "更加", "通过", "以及", "就是", "没错"}
+    dynamic_terms: list[str] = []
+    for phrase in phrase_candidates:
+        token = phrase.strip()
+        if not token or token in stop_words or token in dynamic_terms:
+            continue
+        dynamic_terms.append(token)
+        if len(dynamic_terms) >= 4:
+            break
+
+    candidates = sentence_keywords(sentence, preset)
+    filtered: list[str] = []
+    generic = {"政务", "服务", "城市", "群众", "产品", "数据", "平台", "科技", "创新"}
+
+    # 先放句内动态词，再补候选词，尽量避免每句都一样
+    for item in dynamic_terms + [str(x).strip() for x in candidates]:
+        token = str(item).strip()
+        if not token or token in filtered:
+            continue
+        if token in generic and len(filtered) >= 2:
+            continue
+        filtered.append(token)
+        if len(filtered) >= 6:
+            break
+
+    if not filtered:
+        filtered = extract_script_topics(sentence, style, limit=6)
+    return filtered[:4] if filtered else preset[:4]
 
 
 def local_storyboard(script: str, style: str, target_duration: int) -> tuple[list[dict[str, Any]], str]:
